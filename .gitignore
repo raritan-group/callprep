@@ -1,0 +1,15 @@
+# build output
+CallPrep.Api/bin/
+CallPrep.Api/obj/
+CallPrep.Api/wwwroot/
+CallPrep.Web/node_modules/
+CallPrep.Web/dist/
+publish_linux/
+# whisper model (148 MB) — download separately, see README
+models/*.bin
+# local
+*.user
+.vs/
+.env
+appsettings.*.local.json
+models/*.wav
