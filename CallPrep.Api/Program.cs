@@ -90,6 +90,7 @@ builder.Services.AddSingleton(new AnthropicClient());
 builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<Tools>();
 builder.Services.AddSingleton<Agent>();
+builder.Services.AddSingleton<TodayList>();
 string whisperModel = Environment.GetEnvironmentVariable("CALLPREP_WHISPER_MODEL") ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "models", "ggml-base.en.bin"));
 builder.Services.AddSingleton(new Transcriber(File.Exists(whisperModel) ? whisperModel : null));
 
@@ -154,8 +155,21 @@ catch (Exception ex) { Console.Error.WriteLine($"vocabulary load failed: {ex.Mes
 if (Directory.Exists(Path.Combine(app.Environment.ContentRootPath, "wwwroot")))
 {
     app.UseDefaultFiles();
-    app.UseStaticFiles();
+    app.UseStaticFiles(new StaticFileOptions
+    {
+        // index.html must be revalidated on every load so a deploy is picked up on the next refresh; the hashed
+        // assets under /assets can be cached hard (a new build has new names).
+        OnPrepareResponse = c =>
+        {
+            var h = c.Context.Response.Headers;
+            if (c.Context.Request.Path.StartsWithSegments("/assets")) h.CacheControl = "public, max-age=31536000, immutable";
+            else h.CacheControl = "no-cache";
+        }
+    });
 }
+
+if (Environment.GetEnvironmentVariable("CALLPREP_WARM") != "0")   // tests set 0: no background list builds against the live DB
+    app.Services.GetRequiredService<TodayList>().StartWarmer(app.Lifetime.ApplicationStopping);
 
 app.MapGet("/api/health", async (Db db) =>
 {
@@ -201,6 +215,17 @@ app.MapPost("/api/transcribe", async (HttpContext ctx, Transcriber stt, Db db) =
 });
 
 app.MapPost("/api/reset", (HttpContext ctx, Agent agent, ChatRequest req) => { agent.Reset((AccessUser)ctx.Items["user"]!, req.SessionId ?? ""); return Results.Ok(); });
+
+// "This week" list: hard-coded triggers over the scoped views (005_rep_list.sql), each row carrying the question to ask.
+// No model involved: the same account is on the list for the same reason every morning. Cached per login for 30 minutes.
+app.MapGet("/api/today", async (HttpContext ctx, TodayList today, bool? refresh) =>
+{
+    var user = (AccessUser)ctx.Items["user"]!;
+    return Results.Content(await today.Get(user, refresh == true), "application/json");
+});
+
+app.MapGet("/api/admin/list-settings", async (Db db) =>
+    Results.Content((await db.Query("SELECT key, value, note FROM callprep.list_settings ORDER BY key", 100)).json, "application/json"));
 
 // ── admin: who may use Call Prep (gate above already requires role = admin for /api/admin/*) ──
 app.MapGet("/api/admin/users", async (Db db) =>
@@ -586,9 +611,109 @@ sealed class Tools(Db db)
     }
 }
 
+/// The rep's list for the week: five hard-coded triggers (005_rep_list.sql), ranked by dollars, each row with the question
+/// that opens the chat. Everything is a view over the SCOPED tables, so a rep's list is their book and nothing else.
+sealed class TodayList(Db db)
+{
+    public const int PerSection = 8;
+    readonly ConcurrentDictionary<string, (DateTime at, string json)> cache = new();
+    static readonly TimeSpan Ttl = TimeSpan.FromMinutes(30);
+
+    /// Builds every enabled user's list in the background at startup and every 25 minutes, so the page opens with the
+    /// list already there (a rep's book takes ~7 s, all accounts ~9 s). Failures are logged and retried next round.
+    public void StartWarmer(CancellationToken ct) => _ = Task.Run(async () =>
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                string json;
+                using (Db.As(Access.ServiceLogin)) json = (await db.Query("SELECT login, display_name, role, salesrep_id FROM callprep.user_access WHERE enabled AND login LIKE '%@%'", 200)).json;
+                foreach (var r in JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(json)!)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    var login = r["login"]!.ToString()!;
+                    AccessUser? u;
+                    using (Db.As(login)) u = await db.Lookup(login);
+                    if (u is null) continue;
+                    try { using (Db.As(login)) await Get(u, refresh: true, warm: true); }
+                    catch (Exception ex) { Console.Error.WriteLine($"today warm {login}: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"today warmer: {ex.Message}"); }
+            try { await Task.Delay(TimeSpan.FromMinutes(25), ct); } catch (OperationCanceledException) { }
+        }
+    }, ct);
+
+    public async Task<string> Get(AccessUser u, bool refresh, bool warm = false)
+    {
+        if (!refresh && cache.TryGetValue(u.Login, out var c) && DateTime.UtcNow - c.at < Ttl) return c.json;
+        var sw = Stopwatch.StartNew();
+        var sections = new List<object>();
+
+        var qt = await Total("SELECT count(*), COALESCE(SUM(quote_value),0) FROM callprep.list_stale_quotes");
+        var qu = await Total("SELECT count(*), COALESCE(SUM(sales_12m),0) FROM callprep.list_going_quiet");
+        var rt = await Total("SELECT count(*), COALESCE(SUM(sales_12m),0) FROM callprep.list_reorder_due");
+        var nt = await Total("SELECT count(*), COALESCE(SUM(sales_to_date),0) FROM callprep.list_new_accounts");
+
+        var quotes = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, order_no::text AS order_no, quote_date::text AS quote_date, age_days, quote_value, lines, taker, product_groups
+                                            FROM callprep.list_stale_quotes ORDER BY quote_value DESC LIMIT @p0", PerSection, PerSection));
+        sections.Add(Section("stale_quotes", "Quotes to chase", "Open quotes 1 to 13 weeks old, biggest first. P21 never closes quotes, so these are the live ones.", qt.n, Compact(qt.sum) + " quoted",
+            quotes.Select(r => Row(r, $"Quote #{r["order_no"]} · {Money(r["quote_value"])} · {r["age_days"]} days old · {r["lines"]} lines" + (r["taker"] is string t && t.Length > 0 ? $" · quoted by {t}" : ""),
+                Money(r["quote_value"]), $"Quote {r["order_no"]} with {r["customer_name"]} is {r["age_days"]} days old. What is in it, what else is open with them, and what should I ask on the call?"))));
+
+        var quiet = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, last_invoice::text AS last_invoice, days_silent, usual_gap_days, invoice_days_12m, sales_12m
+                                           FROM callprep.list_going_quiet ORDER BY sales_12m DESC LIMIT @p0", PerSection, PerSection));
+        sections.Add(Section("going_quiet", "Gone quiet", "Accounts silent for longer than their own usual gap between invoices. Their pattern, not a fixed 90 days.", qu.n, Compact(qu.sum) + " a year at risk",
+            quiet.Select(r => Row(r, $"No invoice for {r["days_silent"]} days, usually every {r["usual_gap_days"]} · {Money(r["sales_12m"])} last 12 months · last invoice {r["last_invoice"]}",
+                Money(r["sales_12m"]), $"{r["customer_name"]} usually buys every {r["usual_gap_days"]} days and has been quiet for {r["days_silent"]}. What were they buying, is anything open, and what changed?"))));
+
+        var reorder = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, product_group_desc, last_buy::text AS last_buy, days_since, usual_gap_days, sales_12m
+                                             FROM callprep.list_reorder_due ORDER BY sales_12m DESC LIMIT @p0", PerSection, PerSection));
+        sections.Add(Section("reorder_due", "Reorder due", "A product group this account buys on a rhythm, now past it. A reminder call, not a pitch.", rt.n, Compact(rt.sum) + " a year in these groups",
+            reorder.Select(r => Row(r, $"{r["product_group_desc"]} · every {r["usual_gap_days"]} days, now {r["days_since"]} · {Money(r["sales_12m"])} a year in this group",
+                Money(r["sales_12m"]), $"{r["customer_name"]} buys {r["product_group_desc"]} about every {r["usual_gap_days"]} days and it has been {r["days_since"]}. What do they usually order in that group and what should I bring up?"))));
+
+        var gaps = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, sales_12m, product_group_desc, penetration_pct, avg_sales_per_buyer, my_last_purchase::text AS my_last_purchase, status, other_gaps
+                                          FROM callprep.list_category_gaps()", PerSection + 4));
+        sections.Add(Section("category_gaps", "Gaps", "What similar customers buy that your biggest accounts don't: each compared with the 40 customers whose buying mix looks most like theirs.", gaps.Count, Compact(gaps.Sum(r => Dec(r["avg_sales_per_buyer"]))) + " a year if they bought like their peers",
+            gaps.Select(r => Row(r, $"{r["product_group_desc"]} · {r["penetration_pct"]}% of lookalikes buy it, about {Money(r["avg_sales_per_buyer"])} each · " + (r["status"]?.ToString()?.StartsWith("bought") == true ? $"last bought {r["my_last_purchase"]}" : "never bought") + (int.TryParse(r["other_gaps"]?.ToString(), out var og) && og > 0 ? $" · {og} more gaps" : ""),
+                Money(r["sales_12m"]), $"What is {r["customer_name"]} not buying that similar customers are?"))));
+
+        var fresh = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, first_invoice::text AS first_invoice, days_ago, sales_to_date, invoices, product_groups
+                                           FROM callprep.list_new_accounts ORDER BY sales_to_date DESC LIMIT @p0", PerSection, PerSection));
+        sections.Add(Section("new_accounts", "New accounts", "First invoice within the last six weeks. A second order is the one that makes them a customer.", nt.n, Compact(nt.sum) + " so far",
+            fresh.Select(r => Row(r, $"First invoice {r["first_invoice"]} · {r["invoices"]} invoice(s), {Money(r["sales_to_date"])} so far · {Groups(r["product_groups"])}",
+                Money(r["sales_to_date"]), $"{r["customer_name"]} is a new account. What have they bought so far, and what do similar customers buy that I should offer next?"))));
+
+        sw.Stop();
+        var json = JsonSerializer.Serialize(new { scope = u.ScopeText, generated_at = DateTime.Now.ToString("yyyy-MM-dd HH:mm"), ms = sw.ElapsedMilliseconds, sections });
+        cache[u.Login] = (DateTime.UtcNow, json);
+        await db.Audit(u.Login, "", warm ? "today_warm" : "today", new { ms = sw.ElapsedMilliseconds, rows = new { quotes = quotes.Count, quiet = quiet.Count, reorder = reorder.Count, gaps = gaps.Count, fresh = fresh.Count } }, sw.ElapsedMilliseconds);
+        return json;
+    }
+
+    static List<Dictionary<string, object?>> Rows((string json, int rows, long ms) r) => JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(r.json)!;
+    static object Section(string key, string title, string blurb, int count, string headline, IEnumerable<object> rows) => new { key, title, blurb, count, headline, rows = rows.ToList() };
+    async Task<(int n, decimal sum)> Total(string sql)
+    {
+        var r = Rows(await db.Query(sql, 1))[0];
+        return (int.Parse(r["count"]!.ToString()!), Dec(r["coalesce"]));
+    }
+    static decimal Dec(object? v) => decimal.TryParse(v?.ToString(), out var d) ? d : 0;
+    /// $1.2M / $480K / $950 for tiles
+    static string Compact(decimal d) => d >= 1_000_000 ? "$" + (d / 1_000_000m).ToString("0.#") + "M" : d >= 10_000 ? "$" + Math.Round(d / 1000m) + "K" : "$" + d.ToString("N0");
+    static object Row(Dictionary<string, object?> r, string detail, string dollars, string question) => new { customer_id = r["customer_id"]?.ToString(), customer_name = r["customer_name"]?.ToString(), detail, dollars, question };
+    static string Money(object? v) => v is null ? "" : decimal.TryParse(v.ToString(), out var d) ? "$" + d.ToString("N0") : v.ToString()!;
+    static string Groups(object? v) => v is JsonElement e && e.ValueKind == JsonValueKind.Array ? string.Join(", ", e.EnumerateArray().Take(4).Select(x => x.GetString())) : "";
+}
+
 static class SqlGuard
 {
-    static readonly Regex Forbidden = new(@"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|call|do|execute|pg_sleep|pg_read|pg_write|lo_|dblink|set\s|reset\s|vacuum|analyze|listen|notify|refresh)\b", RegexOptions.IgnoreCase);
+    // Two groups: whole words, and prefixes (pg_read_file, lo_import, set_config...) that must NOT carry a trailing \b —
+    // a boundary after "lo_" never matches "lo_import" because "_" is a word character. set_config is the one that matters:
+    // it is the setting the per-rep scoping reads, and a CTE calling it widened a rep's view to every customer (found 9/9/2026).
+    static readonly Regex Forbidden = new(@"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|call|do|execute|pg_sleep|dblink|set|reset|vacuum|analyze|listen|notify|refresh)\b|\b(pg_read|pg_write|pg_ls|pg_stat_file|pg_terminate|pg_cancel|lo_|set_config|current_setting)", RegexOptions.IgnoreCase);
     public static string? Check(string sql)
     {
         if (string.IsNullOrWhiteSpace(sql)) return "empty statement";
@@ -638,11 +763,14 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
         var user = me.Login;
         var total = Stopwatch.StartNew();
         var history = sessions.GetOrAdd($"{user}:{session}", _ => new List<MessageParam>());
-        history.Add(new() { Role = Role.User, Content = question });
+        var asked = new MessageParam { Role = Role.User, Content = question };
+        history.Add(asked);
         await db.Audit(user, session, "question", new { question, role = me.Role, scope = me.ScopeText });
 
         var sb = new StringBuilder();
-        int rounds = 0; long inTok = 0, outTok = 0;
+        int rounds = 0; long inTok = 0, outTok = 0; bool completed = false;
+        try
+        {
         while (rounds++ < 10)
         {
             Message? resp = null; string? apiError = null;
@@ -659,6 +787,7 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
                 }, cancellationToken: ct);
             }
             catch (Exception ex) { apiError = ex.Message; }
+            if (ct.IsCancellationRequested) yield break;      // the user pressed Stop: not an error, cleaned up in finally
             if (resp is null)
             {
                 await db.Audit(user, session, "error", new { error = apiError }, total.ElapsedMilliseconds);
@@ -675,8 +804,11 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
                 if (block.TryPickText(out var text))
                 {
                     assistant.Add(new TextBlockParam { Text = text.Text });
-                    sb.Append(text.Text);
-                    pendingEvents.Add(new { type = "text", text = text.Text });
+                    // a preamble before the tool calls ("I'll look them up.") and the answer after them are separate blocks;
+                    // without a break between rounds they render glued together ("...up first.**Buist...")
+                    var shown = sb.Length > 0 && sb[^1] != '\n' && !text.Text.StartsWith('\n') ? "\n\n" + text.Text : text.Text;
+                    sb.Append(shown);
+                    pendingEvents.Add(new { type = "text", text = shown });
                 }
                 else if (block.TryPickThinking(out var th))
                     assistant.Add(new ThinkingBlockParam { Thinking = th.Thinking, Signature = th.Signature });
@@ -712,7 +844,23 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
             break;
         }
         total.Stop();
+        completed = true;
         await db.Audit(user, session, "answer", new { answer = sb.ToString(), rounds, input_tokens = inTok, output_tokens = outTok }, total.ElapsedMilliseconds);
         yield return new { type = "done", ms = total.ElapsedMilliseconds, input_tokens = inTok, output_tokens = outTok, session_id = session };
+        }
+        finally
+        {
+            if (!completed)
+            {
+                // Stopped (or failed) before an answer: drop the question and any partial exchange so the next question
+                // starts from the last complete turn. A typo'd customer name must not linger in the conversation.
+                lock (history)
+                {
+                    var i = history.IndexOf(asked);
+                    if (i >= 0) history.RemoveRange(i, history.Count - i);
+                }
+                await db.Audit(user, session, ct.IsCancellationRequested ? "stopped" : "incomplete", new { question, rounds, partial = sb.ToString() }, total.ElapsedMilliseconds);
+            }
+        }
     }
 }

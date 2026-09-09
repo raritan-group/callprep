@@ -11,6 +11,9 @@ type Ev =
 type Me = { login: string; displayName: string | null; role: 'rep' | 'manager' | 'admin'; salesrepId: string | null; salesrepName: string | null; scope: string }
 type AccessRow = { login: string; display_name: string | null; role: string; salesrep_id: string | null; enabled: boolean; notes: string | null; updated_at?: string; updated_by?: string | null }
 type Rep = { salesrep_id: string; salesrep_name: string; customers: number }
+type TodayRow = { customer_id: string; customer_name: string; detail: string; dollars: string; question: string }
+type TodaySection = { key: string; title: string; blurb: string; count: number; headline: string; rows: TodayRow[] }
+type Today = { scope: string; generated_at: string; ms: number; sections: TodaySection[] }
 
 const SUGGESTIONS = [
   'What is Buist not buying that similar contractors are?',
@@ -92,6 +95,48 @@ function AccessPanel({ me, onClose }: { me: Me; onClose: () => void }) {
   )
 }
 
+/** The week's list: hard-coded triggers over the rep's book (005_rep_list.sql). First glance = five numbers; one section's rows at a time.
+ *  Each row carries the question that opens the chat. */
+function TodayPanel({ today, loading, onAsk, onRefresh }: { today: Today | null; loading: boolean; onAsk: (q: string) => void; onRefresh: () => void }) {
+  const [picked, setPicked] = useState<string | null>(null)
+  if (loading && !today) return <div className="today"><p className="muted">Building your list…</p></div>
+  if (!today) return null
+  const live = today.sections.filter(s => s.count > 0)
+  const current = live.find(s => s.key === picked) ?? live[0]
+  if (!current) return <div className="today"><p className="muted">Nothing on the list this week. Ask about a customer below.</p></div>
+  return (
+    <div className="today">
+      <div className="today-head">
+        <div><strong>This week</strong> <span className="muted">· {today.scope} · as of {today.generated_at}</span></div>
+        <button className="ghost" onClick={onRefresh} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+      </div>
+      <div className="tiles">
+        {live.map(s => (
+          <button key={s.key} className={`tile ${s.key === current.key ? 'on' : ''}`} onClick={() => setPicked(s.key)} title={s.blurb}>
+            <div className="tile-n">{s.count}</div>
+            <div className="tile-t">{s.title}</div>
+            <div className="tile-h">{s.headline}</div>
+          </button>
+        ))}
+      </div>
+      <section className="today-sec">
+        <p className="muted blurb">{current.blurb}{current.count > current.rows.length ? ` Showing the top ${current.rows.length} of ${current.count}.` : ''}</p>
+        <ul>
+          {current.rows.map((r, i) => (
+            <li key={`${current.key}-${r.customer_id}-${i}`} className="today-row">
+              <div className="today-txt">
+                <div className="today-name">{r.customer_name} <span className="today-dollars">{r.dollars}</span></div>
+                <div className="today-detail">{r.detail}</div>
+              </div>
+              <button className="chip ask" title={r.question} onClick={() => onAsk(r.question)}>Prep</button>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
+  )
+}
+
 // Local speech-to-text: capture mic as 16 kHz mono 16-bit WAV in the browser, POST to /api/transcribe (whisper on our server).
 // Nothing is sent to a third-party speech service.
 class Recorder {
@@ -154,12 +199,17 @@ export default function App() {
   const [health, setHealth] = useState<string>('')
   const session = useRef<string>(crypto.randomUUID().replace(/-/g, ''))
   const rec = useRef<Recorder | null>(null)
+  const abort = useRef<AbortController | null>(null)
   const bottom = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const canListen = !!navigator.mediaDevices?.getUserMedia
   const [me, setMe] = useState<Me | null>(null)
   const [auth, setAuth] = useState<'loading' | 'ok' | 'signin' | 'denied' | 'down'>('loading')
   const [deniedLogin, setDeniedLogin] = useState('')
   const [showAccess, setShowAccess] = useState(false)
+  const [today, setToday] = useState<Today | null>(null)
+  const [todayLoading, setTodayLoading] = useState(false)
+  const [showToday, setShowToday] = useState(true)
 
   useEffect(() => {
     // Who am I? The browser answers the Negotiate challenge with the Windows login on a domain PC; nothing to type.
@@ -179,10 +229,18 @@ export default function App() {
       try { sessionStorage.removeItem('cp_signin_at') } catch { /* ignore */ }
       if (r.status === 403) { const j = await r.json().catch(() => ({})); setDeniedLogin(j.login ?? ''); setAuth('denied'); return }
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      setMe(await r.json()); setAuth('ok')
+      setMe(await r.json()); setAuth('ok'); loadToday(false)
     }).catch(() => setAuth('down'))
     fetch('/api/health').then(r => r.json()).then(h => setHealth(`sales current to ${h.sales_current_to} · ${h.model}`)).catch(() => setHealth('API not reachable'))
   }, [])
+  async function loadToday(refresh: boolean) {
+    setTodayLoading(true)
+    try {
+      const r = await fetch(`/api/today${refresh ? '?refresh=true' : ''}`)
+      if (r.ok) setToday(await r.json())
+    } catch { /* the list is optional; the chat still works */ }
+    finally { setTodayLoading(false) }
+  }
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, status])
   useEffect(() => {
     if (!listening) { setLevel(0); return }
@@ -191,22 +249,34 @@ export default function App() {
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
   }, [listening])
+  /** Stop the answer in flight (typo, wrong customer). The server drops the question from the conversation; the text
+   *  goes back into the box so it can be fixed and re-sent. */
+  const stop = () => abort.current?.abort()
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && listening) { rec.current?.stop(); setListening(false) } }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (listening) { rec.current?.stop(); setListening(false) }
+      else if (busy) stop()
+    }
     window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey)
-  }, [listening])
+  }, [listening, busy])
+
 
   async function ask(q: string) {
     const question = q.trim()
     if (!question || busy) return
     setInput('')
+    setStatus('')
     setBusy(true)
     setMsgs(m => [...m, { role: 'user', text: question }, { role: 'assistant', text: '', tools: [] }])
     const t0 = performance.now()
+    const ctl = new AbortController()
+    abort.current = ctl
     try {
       const res = await fetch('/api/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: session.current, message: question }),
+        signal: ctl.signal,
       })
       if (res.status === 401) { location.href = `/signin?returnUrl=${encodeURIComponent(location.pathname)}`; return }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
@@ -237,8 +307,15 @@ export default function App() {
         }
       }
     } catch (e) {
-      setMsgs(m => { const c = [...m]; const last = { ...c[c.length - 1] }; last.text += `\n⚠ ${(e as Error).message}`; c[c.length - 1] = last; return c })
+      if ((e as Error).name === 'AbortError') {
+        // stopped on purpose: remove the question and the empty answer, hand the text back for editing
+        setMsgs(m => m.slice(0, -2))
+        setInput(question)
+      } else {
+        setMsgs(m => { const c = [...m]; const last = { ...c[c.length - 1] }; last.text += `\n⚠ ${(e as Error).message}`; c[c.length - 1] = last; return c })
+      }
     } finally {
+      abort.current = null
       setBusy(false); setStatus('')
       if (!msgs.length) console.debug('first answer', Math.round(performance.now() - t0), 'ms')
     }
@@ -252,8 +329,9 @@ export default function App() {
       try {
         const r = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': 'audio/wav', 'X-Session': session.current }, body: blob })
         const j = await r.json()
-        if (j.text) { setInput(j.text); ask(j.text) }
-        else setStatus("didn't catch that, try again")
+        // Transcript goes into the box for review; nothing is sent until Ask is pressed (Paul, 9/9: names get misheard)
+        if (j.text) { setInput(j.text); setStatus('Check the text, then press Ask'); setTimeout(() => inputRef.current?.focus(), 0) }
+        else setStatus("Didn't catch that, try again")
       } catch { setStatus('transcription failed') }
       finally { setTranscribing(false) }
       return
@@ -266,7 +344,7 @@ export default function App() {
   async function reset() {
     await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: session.current, message: '' }) })
     session.current = crypto.randomUUID().replace(/-/g, '')
-    setMsgs([])
+    setMsgs([]); setShowToday(true)
   }
 
   if (auth !== 'ok' || !me) {
@@ -305,6 +383,7 @@ export default function App() {
           {health}
         </div>
         {me.role === 'admin' && <button className="ghost" onClick={() => setShowAccess(s => !s)}>{showAccess ? 'Hide access' : 'Access'}</button>}
+        <button className="ghost" onClick={() => setShowToday(t => !t)}>{showToday ? 'Hide list' : 'This week'}</button>
         <button className="ghost" onClick={reset} disabled={busy}>New conversation</button>
         <a className="ghost" href="/signout" title={me.login}>Sign out</a>
       </header>
@@ -312,6 +391,7 @@ export default function App() {
       {showAccess && <AccessPanel me={me} onClose={() => setShowAccess(false)} />}
 
       <main>
+        {showToday && <TodayPanel today={today} loading={todayLoading} onAsk={q => { setShowToday(false); ask(q) }} onRefresh={() => loadToday(true)} />}
         {msgs.length === 0 && (
           <div className="empty">
             <p>Ask about a customer before a call. Tap the mic or type.</p>
@@ -334,6 +414,7 @@ export default function App() {
       </main>
 
       <footer>
+        {status && !busy && <div className="hint">{status}</div>}
         <form onSubmit={e => { e.preventDefault(); ask(input) }}>
           {canListen && (
             <button type="button" className={`mic ${listening ? 'on' : ''} ${transcribing ? 'busy' : ''}`} onClick={toggleMic} disabled={busy || transcribing}
@@ -357,8 +438,12 @@ export default function App() {
               {Array.from({ length: 12 }, (_, i) => <span key={i} style={{ height: `${20 + Math.max(0, Math.min(1, level * 1.6 - i * 0.08)) * 80}%` }} />)}
             </div>
           )}
-          <input value={input} onChange={e => setInput(e.target.value)} placeholder={listening ? 'Listening… tap the square when done' : transcribing ? 'Transcribing…' : 'Ask about a customer…'} disabled={busy} autoFocus />
-          <button type="submit" disabled={busy || !input.trim()}>Ask</button>
+          <input ref={inputRef} value={input} onChange={e => { setInput(e.target.value); if (status) setStatus('') }} placeholder={listening ? 'Listening… tap the square when done' : transcribing ? 'Transcribing…' : 'Ask about a customer…'} disabled={busy} autoFocus />
+          {/* distinct keys: React must replace the node, not patch it. Patching turned the just-clicked Stop button into the
+              submit button before the browser ran the click's default action, which re-submitted the restored text. */}
+          {busy
+            ? <button key="stop" type="button" className="stop" onMouseDown={e => e.preventDefault()} onClick={e => { e.preventDefault(); stop() }} title="Stop this answer (Esc)">Stop</button>
+            : <button key="ask" type="submit" disabled={!input.trim()}>Ask</button>}
         </form>
       </footer>
     </div>
