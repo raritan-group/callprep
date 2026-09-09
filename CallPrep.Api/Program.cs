@@ -428,8 +428,10 @@ sealed class Tools(Db db)
 
     public static readonly Tool[] Definitions =
     [
-        T("find_customer", "Find customers by name fragment or customer id. Always call this first when the user names a company; use the returned customer_id for every other tool.",
+        T("find_customer", "Find customers by name fragment or customer id. Always call this first when the user names a company; use the returned customer_id for every other tool. Returns the customer's address, city, state, zip and phone from P21.",
           new { query = P("string", "Part of the customer name, or the numeric customer id") }, ["query"]),
+        T("customers_near", "Customers located near a place: by town/city name, 5-digit zip (nearby = same first 3 digits), or 2-letter state. Uses the customer's own address from P21 (billing/physical), not job-site ship-tos. Returns active customers first with 12-month sales, rep, address and phone. Use for 'I'm visiting X today, who else is in the area'.",
+          new { place = P("string", "Town/city name, 5-digit zip, or 2-letter state"), exclude_customer_id = P("string", "Optional: the account already being visited, left out of the results"), limit = P("integer", "Max rows (default 25)") }, ["place"]),
         T("customer_snapshot", "Profile plus sales totals for a customer: market class, rep, trailing-12-month and prior-12-month sales, lifetime sales, last invoice date, top product groups (12 months), open quotes and open orders totals.",
           new { customer_id = P("string", "Customer id from find_customer") }, ["customer_id"]),
         T("peer_gap", "What similar customers buy that this customer does not. 'Similar' = the 40 customers whose product-group purchase mix is most alike (cosine similarity on trailing-12-month sales), NOT the market-class label. Returns product groups this customer is NOT buying (12 months) that at least min_penetration_pct of those lookalikes do buy, plus the top lookalikes so you can name them. This is the core cross-sell question; use it first.",
@@ -444,7 +446,7 @@ sealed class Tools(Db db)
           new { customer_id = P("string", "Customer id"), months = P("integer", "Look-back window in months (default 12)") }, ["customer_id"]),
         T("class_overview", "Market-class view: for a given customer_class (CONTRACTOR, UTILITY, PROCESS, RESALE, ENERGY, Engineering, Transportation), the most common product groups by penetration and average sales per buyer. Use to describe what a market segment typically buys.",
           new { customer_class = P("string", "Customer class name"), top = P("integer", "How many product groups (default 25)") }, ["customer_class"]),
-        T("run_select", "Escape hatch: run a read-only SQL SELECT against the callprep schema when no other tool answers the question. Available views: callprep.customer(customer_id, customer_name, customer_class, salesrep_id, salesrep_name); callprep.sales_line(invoice_no, line_no, order_no, invoice_date, customer_id, customer_name, salesrep_id, taker, item_id, item_desc, qty_shipped, unit_price, extended_price, product_group_id, product_group_desc, supplier_name, location_id, county, ship_city, ship_state); callprep.open_quote_line, callprep.open_order_line, callprep.cancelled_quote_line (same shape, order_no/order_date/qty_ordered/extended_price; cancelled adds cancel_reason_desc); callprep.customer_pg_12m(customer_id, product_group_id, product_group_desc, sales_12m, lines_12m, last_invoice_date); callprep.customer_pg_ltd(... sales_ltd, first_invoice_date, last_invoice_date); callprep.class_pg_penetration(customer_class, product_group_id, product_group_desc, buyers_12m, active_customers, penetration_pct, class_sales_12m, avg_sales_per_buyer). Postgres syntax. Single SELECT or WITH, no semicolons, max 200 rows returned.",
+        T("run_select", "Escape hatch: run a read-only SQL SELECT against the callprep schema when no other tool answers the question. Available views: callprep.customer(customer_id, customer_name, customer_class, salesrep_id, salesrep_name, address, city, state, zip, phone -- the customer's own P21 address); callprep.sales_line(invoice_no, line_no, order_no, invoice_date, customer_id, customer_name, salesrep_id, taker, item_id, item_desc, qty_shipped, unit_price, extended_price, product_group_id, product_group_desc, supplier_name, location_id, county, ship_city, ship_state); callprep.open_quote_line, callprep.open_order_line, callprep.cancelled_quote_line (same shape, order_no/order_date/qty_ordered/extended_price; cancelled adds cancel_reason_desc); callprep.customer_pg_12m(customer_id, product_group_id, product_group_desc, sales_12m, lines_12m, last_invoice_date); callprep.customer_pg_ltd(... sales_ltd, first_invoice_date, last_invoice_date); callprep.class_pg_penetration(customer_class, product_group_id, product_group_desc, buyers_12m, active_customers, penetration_pct, class_sales_12m, avg_sales_per_buyer). Postgres syntax. Single SELECT or WITH, no semicolons, max 200 rows returned.",
           new { sql = P("string", "The SELECT statement"), purpose = P("string", "One line on what this query answers") }, ["sql", "purpose"]),
     ];
 
@@ -468,7 +470,7 @@ sealed class Tools(Db db)
             case "find_customer":
             {
                 var q = S("query").Trim();
-                var sql = @"SELECT c.customer_id, c.customer_name, c.customer_class, c.salesrep_name,
+                var sql = @"SELECT c.customer_id, c.customer_name, c.customer_class, c.salesrep_name, c.address, c.city, c.state, c.zip, c.phone,
                               (SELECT ROUND(COALESCE(SUM(sales_12m),0)) FROM callprep.customer_pg_12m p WHERE p.customer_id=c.customer_id) AS sales_12m,
                               (SELECT MAX(last_invoice_date) FROM callprep.customer_pg_ltd p WHERE p.customer_id=c.customer_id) AS last_invoice
                             FROM callprep.customer c
@@ -478,7 +480,7 @@ sealed class Tools(Db db)
                 if (r.rows == 0 && q.Length >= 3)
                 {
                     // fuzzy fallback for spoken / misheard names: trigram similarity + double-metaphone on the first word
-                    var fsql = @"SELECT c.customer_id, c.customer_name, c.customer_class, c.salesrep_name,
+                    var fsql = @"SELECT c.customer_id, c.customer_name, c.customer_class, c.salesrep_name, c.city, c.state,
                                    (SELECT ROUND(COALESCE(SUM(sales_12m),0)) FROM callprep.customer_pg_12m p WHERE p.customer_id=c.customer_id) AS sales_12m,
                                    ROUND(public.similarity(c.customer_name::text, @p0)::numeric, 2) AS name_similarity,
                                    'fuzzy match: confirm with the user if unsure' AS note
@@ -489,6 +491,25 @@ sealed class Tools(Db db)
                     var f = await db.Query(fsql, 8, q);
                     return (f.json, fsql, f.rows, r.ms + f.ms);
                 }
+                return (r.json, sql, r.rows, r.ms);
+            }
+            case "customers_near":
+            {
+                var place = S("place").Trim(); var excl = S("exclude_customer_id").Trim(); var limit = Math.Clamp(I("limit", 25), 1, 100);
+                var isZip = Regex.IsMatch(place, @"^\d{5}$");
+                var isState = Regex.IsMatch(place, @"^[A-Za-z]{2}$");
+                var where = isZip ? "LEFT(c.zip,3) = LEFT(@p0,3)" : isState ? "upper(c.state) = upper(@p0)" : "c.city ILIKE @p0";
+                var how = isZip ? "CASE WHEN c.zip = @p0 THEN 'same zip' ELSE 'nearby zip' END" : "'match'";
+                var sql = @"SELECT c.customer_id, c.customer_name, c.customer_class, c.salesrep_name, c.address, c.city, c.state, c.zip, c.phone,
+                              (SELECT ROUND(COALESCE(SUM(sales_12m),0)) FROM callprep.customer_pg_12m p WHERE p.customer_id=c.customer_id) AS sales_12m,
+                              (SELECT MAX(last_invoice_date) FROM callprep.customer_pg_ltd p WHERE p.customer_id=c.customer_id) AS last_invoice,
+                              " + how + @" AS how
+                            FROM callprep.customer c
+                            WHERE " + where + @" AND c.customer_id::text <> @p1
+                            ORDER BY sales_12m DESC NULLS LAST, last_invoice DESC NULLS LAST LIMIT @p2";
+                var r = await db.Query(sql, limit, place, excl, limit);
+                if (r.rows == 0)
+                    return (JsonSerializer.Serialize(new { note = $"No customers in your book with an address matching '{place}'. Try the town name, a 5-digit zip (matches the surrounding zips too), or the state. Ship-to history in callprep.sales_line (ship_city, county) is a fallback for job-site geography." }), sql, 0, r.ms);
                 return (r.json, sql, r.rows, r.ms);
             }
             case "customer_snapshot":
@@ -748,6 +769,7 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
         How to work:
         - When a company is named, call find_customer first, then use the customer_id. If several match, pick the one with the most recent sales and say which you picked.
         - "What is X not buying that similar customers are" = peer_gap. Peers are the customers whose purchase mix looks most like this one (behavior, not the class label). Name two or three of the lookalikes so the rep can judge the comparison ("compared against 40 shops like Bennett Brothers Mechanical and L&L Mechanical"). Use class_gap only if asked for the market-class view, and caveat that the class label mixes trades.
+        - "Who else is near X" or "I'm visiting X today" = find_customer for X, then customers_near with X's town or zip (exclude X). Say which is the customer's own address versus job-site ship-to history; contractors work all over.
         - Prefer the named tools. Use run_select only when they cannot answer the question.
         - Be fast and concrete. A rep reads this in the minute before a call. Lead with the answer, then 3 to 6 short bullets with dollar figures and dates. Name product groups the way the data names them. Do not pad, do not restate the question.
         - Judgment: the data shows what a customer buys, not what kind of contractor they are. If a gap looks like something they would never buy (an underground pipe group for a mechanical contractor, for example), say that as a caveat rather than pitching it.

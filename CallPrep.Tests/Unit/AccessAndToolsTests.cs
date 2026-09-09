@@ -41,10 +41,10 @@ public class AccessTests
 
 public class ToolDefinitionTests
 {
-    static readonly string[] Expected = ["find_customer", "customer_snapshot", "peer_gap", "class_gap", "recent_activity", "open_quotes", "cancelled_quotes", "class_overview", "run_select"];
+    static readonly string[] Expected = ["find_customer", "customers_near", "customer_snapshot", "peer_gap", "class_gap", "recent_activity", "open_quotes", "cancelled_quotes", "class_overview", "run_select"];
 
     [Fact]
-    public void All_nine_tools_are_defined_once()
+    public void All_ten_tools_are_defined_once()
     {
         var names = Tools.Definitions.Select(t => t.Name).ToArray();
         Assert.Equal(Expected.OrderBy(x => x), names.OrderBy(x => x));

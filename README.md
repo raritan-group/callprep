@@ -14,13 +14,14 @@ Sales call-prep assistant. A rep asks a question about a customer (typed or spok
 | `rg-scripts/webapps/callprep/sql/002_lookalikes.sql` | Behavior-based lookalikes (cosine on 12-month product-group mix). Superseded in part by 003. |
 | `rg-scripts/webapps/callprep/sql/003_access_control.sql` | Per-user access control inside the database: `user_access` table, scope functions, scoped views, SECURITY DEFINER lookalike functions, admin guard trigger, seed. |
 | `sql/005_rep_list.sql` | The week's list: `list_settings` thresholds, five trigger views/functions over the scoped views. |
+| `sql/006_customer_address.sql` | Customer address, city, state, zip, phone on `customer_all` / `customer`, from the P21 address the reports sync carries since 2026-09-09. |
 
 ## Data
 
 Source is the ReportsApp Postgres on the Hetzner box (`reportsdb`), which `reports_push.ps1` refreshes from P21 every 15 minutes. No P21 connection, no P21 lock exposure, no new SQL Server login.
 
 Views (all read-only, owned by postgres):
-- `customer` (id, name, market class, rep) · `sales_line` (invoices since 2022-03-30, sell price only) · `open_quote_line` · `open_order_line` · `cancelled_quote_line`
+- `customer` (id, name, market class, rep, address/city/state/zip/phone from P21 `address.id = customer_id`, synced by `reports_push.ps1` since 9/9/2026) · `sales_line` (invoices since 2022-03-30, sell price only) · `open_quote_line` · `open_order_line` · `cancelled_quote_line`
 - `customer_pg_12m`, `customer_pg_ltd` (customer x product group rollups) · `class_pg_penetration` (market class x product group: share of active peers buying it)
 - `audit_log` (question / tool / sql / answer / error per session)
 
@@ -74,7 +75,7 @@ The landing screen is a list, not an empty chat. Five hard-coded triggers run ov
 
 ## Tools the model can call
 
-`find_customer` (exact, then trigram + double-metaphone fuzzy fallback for misheard names), `customer_snapshot`, `peer_gap` (what same-class peers buy that this customer doesn't), `recent_activity`, `open_quotes` (default 180 days; P21 never closes quotes), `cancelled_quotes`, `class_overview`, and `run_select` (guarded free-form SELECT: `callprep.*` only, single statement, no writes, 200-row cap).
+`find_customer` (exact, then trigram + double-metaphone fuzzy fallback for misheard names; returns the customer's own address), `customers_near` (town, 5-digit zip with its neighbours, or state: "I'm visiting X, who else is in the area"), `customer_snapshot`, `peer_gap` (what same-class peers buy that this customer doesn't), `recent_activity`, `open_quotes` (default 180 days; P21 never closes quotes), `cancelled_quotes`, `class_overview`, and `run_select` (guarded free-form SELECT: `callprep.*` only, single statement, no writes, 200-row cap).
 
 ## Run locally
 

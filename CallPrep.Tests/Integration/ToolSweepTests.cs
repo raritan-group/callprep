@@ -169,6 +169,36 @@ public class ToolSweepTests(DbFixture fx, ITestOutputHelper log) : IClassFixture
     }
 
     [SkippableFact]
+    public async Task Customers_near_by_town_zip_and_state_uses_the_customers_own_address()
+    {
+        TestEnv.RequireTunnel();
+        using var _ = Db.As(TestEnv.AdminLogin);
+        var (bj, _, bn, _) = await fx.Tools.Invoke("find_customer", Args(new { query = "Buist" }));
+        Assert.Equal(1, bn);
+        var buist = JsonDocument.Parse(bj).RootElement[0];
+        Skip.If(buist.GetProperty("city").ValueKind == JsonValueKind.Null, "address columns not synced yet (next Agent run)");
+        Assert.Equal("MONMOUTH JUNCTION", buist.GetProperty("city").GetString()!.ToUpperInvariant());
+        Assert.Equal("08852", buist.GetProperty("zip").GetString());
+
+        var (tj, _, tn, _) = await fx.Tools.Invoke("customers_near", Args(new { place = "Monmouth Junction", exclude_customer_id = "10046" }));
+        AssertClean("customers_near", tj, tn);
+        Assert.True(tn > 0, tj);
+        Assert.DoesNotContain("BUIST", tj);
+        log.WriteLine($"near Monmouth Junction: {tn} -> " + string.Join(", ", JsonDocument.Parse(tj).RootElement.EnumerateArray().Take(5).Select(r => r.GetProperty("customer_name").GetString())));
+
+        var (zj, _, zn, _) = await fx.Tools.Invoke("customers_near", Args(new { place = "08852", limit = 10 }));
+        AssertClean("customers_near", zj, zn);
+        Assert.True(zn > 0);
+        Assert.Contains("same zip", zj);
+
+        var (sj, _, sn, _) = await fx.Tools.Invoke("customers_near", Args(new { place = "NJ", limit = 5 }));
+        Assert.Equal(5, sn);
+
+        var (nj, _, nn, _) = await fx.Tools.Invoke("customers_near", Args(new { place = "Nowheresville" }));
+        Assert.Equal(0, nn); Assert.Contains("note", nj);
+    }
+
+    [SkippableFact]
     public async Task run_select_executes_through_the_guard_and_caps_rows()
     {
         TestEnv.RequireTunnel();

@@ -124,6 +124,19 @@ public class ChatTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtu
         Assert.Contains("Buist", t.Text, StringComparison.OrdinalIgnoreCase);
     }
 
+    [SkippableFact]
+    public async Task Nearby_question_uses_the_customers_own_addresses()
+    {
+        TestEnv.RequireTunnel(); TestEnv.RequireLive();
+        var c = app.ClientAs(TestEnv.AdminLogin);
+        c.Timeout = TimeSpan.FromMinutes(3);
+        var t = await Ask(c, TestEnv.TestSessionPrefix + Guid.NewGuid().ToString("N"), "I'm visiting Walsh Construction today, what other companies are in the area that I can also visit?");
+        Report("Walsh Construction", "nearby", t);
+        Assert.Empty(t.Errors);
+        Assert.Contains(t.Tools, x => x.StartsWith("customers_near"));
+        Assert.True(t.Text.Length > 80);
+    }
+
     void Report(string customer, string kind, Turn t)
     {
         log.WriteLine($"── {customer} · {kind} · {t.Ms / 1000.0:F1} s · in {t.InTok} / out {t.OutTok} tokens");
