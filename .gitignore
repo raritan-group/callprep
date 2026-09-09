@@ -13,3 +13,12 @@ models/*.bin
 .env
 appsettings.*.local.json
 models/*.wav
+# tests
+tests/results/
+CallPrep.Web/e2e/.auth/
+CallPrep.Web/playwright-report/
+CallPrep.Web/test-results/
+
+# build output (any project)
+**/bin/
+**/obj/

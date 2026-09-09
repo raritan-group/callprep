@@ -14,4 +14,8 @@
     <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="CallPrep.Tests" />
+  </ItemGroup>
+
 </Project>

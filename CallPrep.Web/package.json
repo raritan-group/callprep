@@ -7,13 +7,17 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:ui": "playwright test --project=ui",
+    "test:e2e": "playwright test --project=chromium",
+    "test:e2e:setup": "playwright test --project=setup"
   },
   "dependencies": {
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
