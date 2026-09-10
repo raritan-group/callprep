@@ -111,6 +111,7 @@ GRANT USAGE, SELECT ON SEQUENCE callprep.task_outbox_id_seq TO callprep_ro;
 -- the VMSQL2 job connects as reportsapp and updates status/activity_trans_no
 GRANT SELECT, UPDATE ON callprep.task_outbox TO reportsapp;
 GRANT USAGE ON SCHEMA callprep TO reportsapp;
+GRANT SELECT ON callprep.p21_user, callprep.task, callprep.task_type, callprep.user_access TO reportsapp;   -- the claim query resolves logins to P21 ids
 
 -- a rep may only create tasks as themselves and only complete tasks they can see
 CREATE OR REPLACE FUNCTION callprep.task_outbox_guard() RETURNS trigger
