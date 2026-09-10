@@ -14,6 +14,7 @@ Sales call-prep assistant. A rep asks a question about a customer (typed or spok
 | `rg-scripts/webapps/callprep/sql/002_lookalikes.sql` | Behavior-based lookalikes (cosine on 12-month product-group mix). Superseded in part by 003. |
 | `rg-scripts/webapps/callprep/sql/003_access_control.sql` | Per-user access control inside the database: `user_access` table, scope functions, scoped views, SECURITY DEFINER lookalike functions, admin guard trigger, seed. |
 | `sql/005_rep_list.sql` | The week's list: `list_settings` thresholds, five trigger views/functions over the scoped views. |
+| `sql/007_tasks.sql` | Tasks: outbox, synced `activity_trans`/`p21_users`, `task` view, guard trigger, task types. |
 | `sql/006_customer_address.sql` | Customer address, city, state, zip, phone on `customer_all` / `customer`, from the P21 address the reports sync carries since 2026-09-09. |
 
 ## Data
@@ -58,6 +59,17 @@ pwsh -File C:\Users\it\CallPrep\deploy-hetzner.ps1            # UI + API
 pwsh -File C:\Users\it\CallPrep\deploy-hetzner.ps1 -WithModel # first time / model change (148 MB)
 ```
 On the box: `/opt/callprep` (publish output, framework-dependent linux-x64, .NET 10 runtime already installed), `/etc/callprep.env` (root-only: Entra ids + secret, Anthropic key, `PG_PASSWORD_CALLPREP`, `CALLPREP_BASE_URL`, Postgres at 127.0.0.1:5432), systemd unit `callprep` (port 5080, `MemoryMax=700M`), nginx site `callprep` for `callprep.raritangroup.com` (proxy to 5080, `proxy_buffering off` for the SSE stream, 25 MB body for audio). TLS: `certbot --nginx -d callprep.raritangroup.com` once the A record points at 178.156.238.36. Whisper runs on the box (avx2, ~270 MB RSS).
+
+## Tasks (P21 is the system of record)
+
+A task typed or spoken in Call Prep ("assign Doug a follow-up on Buist for Friday") becomes a card the person checks and saves. Nothing is saved by the model. Saved tasks go to `callprep.task_outbox` on Hetzner, show on the assignee's week list immediately, and are applied to P21 within five minutes by the SQL Agent job **CallPrep - Task writeback to P21** on VMSQL2 (`C:\RSC_Scripts\callprep_task_writeback.ps1`, source `rg-scriptseporting\`), which calls P21's own `p21_add_activity_trans` so the number comes from P21's counter and the task appears in P21 Task Manager. The 15-minute reports sync brings `activity_trans` and `users` back (`public.activity_trans`, `public.p21_users`), so completions and edits made in P21 show up here too.
+
+- Identity: `callprep.user_access.login` (M365 email) matches P21 `users.email_address`; every enabled Call Prep user resolves to a P21 user id (view `callprep.p21_user`).
+- `callprep.task` view: P21 tasks assigned to or by the signed-in person (managers: all) plus outbox rows not yet in P21; customer names through the scoped customer view.
+- Guard trigger on the outbox: a rep can only create tasks as themselves, only assign to Call Prep users with a P21 id, and only complete tasks they can see.
+- Types offered: `callprep.task_type` (CUST_FU, QUOTE FU, CALL, VISIT, MTG, QUOTE, SUBMITTAL, PRE-BID, COMPLAINT), a subset of P21's `activity` codes.
+- API: `GET /api/tasks` (`?all=true` for managers), `POST /api/tasks`, `POST /api/tasks/{no}/complete`, `GET /api/task-types`, `GET /api/people`. Model tool `draft_task` only produces the card (SSE event `task_draft`). Admins may pass `test: true` to record a row that is never sent to P21 (used by the tests).
+- SQL: `sql/007_tasks.sql`.
 
 ## The week's list (dashboard)
 

@@ -1,17 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
-type Msg = { role: 'user' | 'assistant'; text: string; tools?: string[]; ms?: number }
+type TaskDraft = { activity_id: string; type_label?: string; customer_id: string; customer_name: string; assigned_to: string; assigned_to_name?: string; subject: string; comments?: string; due_date?: string | null; transaction_type_cd?: number | null; transaction_no?: string | null }
+type Msg = { role: 'user' | 'assistant'; text: string; tools?: string[]; ms?: number; draft?: TaskDraft; saved?: string }
 type Ev =
   | { type: 'text'; text: string }
   | { type: 'tool'; name: string; rows: number; ms: number }
   | { type: 'done'; ms: number; input_tokens: number; output_tokens: number; session_id: string }
   | { type: 'error'; text: string }
+  | { type: 'task_draft'; draft: TaskDraft }
 
 type Me = { login: string; displayName: string | null; role: 'rep' | 'manager' | 'admin'; salesrepId: string | null; salesrepName: string | null; scope: string }
 type AccessRow = { login: string; display_name: string | null; role: string; salesrep_id: string | null; enabled: boolean; notes: string | null; updated_at?: string; updated_by?: string | null }
 type Rep = { salesrep_id: string; salesrep_name: string; customers: number }
-type TodayRow = { customer_id: string; customer_name: string; detail: string; dollars: string; question: string }
+type TodayRow = { customer_id: string; customer_name: string; detail: string; dollars: string; question: string; task_no?: string | null }
 type TodaySection = { key: string; title: string; blurb: string; count: number; headline: string; rows: TodayRow[] }
 type Today = { scope: string; generated_at: string; ms: number; sections: TodaySection[] }
 
@@ -95,9 +97,65 @@ function AccessPanel({ me, onClose }: { me: Me; onClose: () => void }) {
   )
 }
 
+/** A task the model drafted (or the person is writing): nothing is saved until Save. Saved tasks go to the outbox and become
+ *  real P21 tasks within five minutes; the assignee sees them on their list immediately. */
+function TaskCard({ draft, sessionId, onSaved, onCancel }: { draft: TaskDraft; sessionId: string; onSaved: (msg: string) => void; onCancel: () => void }) {
+  const [d, setD] = useState<TaskDraft>(draft)
+  const [people, setPeople] = useState<{ login: string; name: string }[]>([])
+  const [types, setTypes] = useState<{ activity_id: string; label: string }[]>([])
+  const [err, setErr] = useState('')
+  const [saving, setSaving] = useState(false)
+  useEffect(() => {
+    fetch('/api/people').then(r => r.json()).then(setPeople).catch(() => {})
+    fetch('/api/task-types').then(r => r.json()).then(setTypes).catch(() => {})
+  }, [])
+  async function save() {
+    setSaving(true); setErr('')
+    try {
+      const r = await fetch('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId: d.customer_id, assignedTo: d.assigned_to, subject: d.subject, activityId: d.activity_id, comments: d.comments, dueDate: d.due_date || null, transactionTypeCd: d.transaction_type_cd ?? null, transactionNo: d.transaction_no ?? null, sessionId }) })
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok) { setErr(j.error || `HTTP ${r.status}`); return }
+      onSaved(j.message || 'Saved.')
+    } catch (e) { setErr((e as Error).message) }
+    finally { setSaving(false) }
+  }
+  return (
+    <div className="taskcard">
+      <div className="taskcard-head"><strong>Task</strong> <span className="muted">on {d.customer_name} · check it, then Save</span></div>
+      <div className="taskcard-grid">
+        <label>Type
+          <select value={d.activity_id} onChange={e => setD({ ...d, activity_id: e.target.value })}>
+            {(types.length ? types : [{ activity_id: d.activity_id, label: d.type_label || d.activity_id }]).map(t => <option key={t.activity_id} value={t.activity_id}>{t.label}</option>)}
+          </select>
+        </label>
+        <label>Assign to
+          <select value={d.assigned_to} onChange={e => setD({ ...d, assigned_to: e.target.value })}>
+            {(people.length ? people : [{ login: d.assigned_to, name: d.assigned_to_name || d.assigned_to }]).map(p => <option key={p.login} value={p.login}>{p.name}</option>)}
+          </select>
+        </label>
+        <label>Due
+          <input type="date" value={d.due_date || ''} onChange={e => setD({ ...d, due_date: e.target.value || null })} />
+        </label>
+        <label className="wide">Subject
+          <input value={d.subject} maxLength={255} onChange={e => setD({ ...d, subject: e.target.value })} />
+        </label>
+        <label className="wide">Details
+          <textarea rows={3} value={d.comments || ''} onChange={e => setD({ ...d, comments: e.target.value })} />
+        </label>
+      </div>
+      {err && <div className="err">⚠ {err}</div>}
+      <div className="taskcard-actions">
+        <button className="chip primary" disabled={saving || !d.subject.trim()} onClick={save}>{saving ? 'Saving…' : 'Save task'}</button>
+        <button className="ghost" onClick={onCancel} disabled={saving}>Cancel</button>
+      </div>
+    </div>
+  )
+}
+
 /** The week's list: hard-coded triggers over the rep's book (005_rep_list.sql). First glance = five numbers; one section's rows at a time.
  *  Each row carries the question that opens the chat. */
-function TodayPanel({ today, loading, onAsk, onRefresh }: { today: Today | null; loading: boolean; onAsk: (q: string) => void; onRefresh: () => void }) {
+function TodayPanel({ today, loading, onAsk, onRefresh, onDone }: { today: Today | null; loading: boolean; onAsk: (q: string) => void; onRefresh: () => void; onDone: (taskNo: string) => void }) {
   const [picked, setPicked] = useState<string | null>(null)
   if (loading && !today) return <div className="today"><p className="muted">Building your list…</p></div>
   if (!today) return null
@@ -128,6 +186,7 @@ function TodayPanel({ today, loading, onAsk, onRefresh }: { today: Today | null;
                 <div className="today-name">{r.customer_name} <span className="today-dollars">{r.dollars}</span></div>
                 <div className="today-detail">{r.detail}</div>
               </div>
+              {r.task_no && <button className="ghost" title="Mark complete in P21" onClick={() => onDone(r.task_no!)}>Done</button>}
               <button className="chip ask" title={r.question} onClick={() => onAsk(r.question)}>Prep</button>
             </li>
           ))}
@@ -301,6 +360,8 @@ export default function App() {
           } else if (ev.type === 'done') {
             setMsgs(m => { const c = [...m]; const last = { ...c[c.length - 1] }; last.ms = ev.ms; c[c.length - 1] = last; return c })
             setStatus('')
+          } else if (ev.type === 'task_draft') {
+            setMsgs(m => { const c = [...m]; const last = { ...c[c.length - 1] }; last.draft = ev.draft; c[c.length - 1] = last; return c })
           } else if (ev.type === 'error') {
             setMsgs(m => { const c = [...m]; const last = { ...c[c.length - 1] }; last.text += `\n⚠ ${ev.text}`; c[c.length - 1] = last; return c })
           }
@@ -339,6 +400,12 @@ export default function App() {
     rec.current = new Recorder()
     await rec.current.start()
     setListening(true)
+  }
+
+  async function completeTask(taskNo: string) {
+    const r = await fetch(`/api/tasks/${encodeURIComponent(taskNo)}/complete`, { method: 'POST' })
+    if (r.ok) { setStatus('Marked done; P21 updates within five minutes.'); loadToday(true) }
+    else { const j = await r.json().catch(() => ({})); setStatus(j.error || `HTTP ${r.status}`) }
   }
 
   async function reset() {
@@ -391,7 +458,7 @@ export default function App() {
       {showAccess && <AccessPanel me={me} onClose={() => setShowAccess(false)} />}
 
       <main>
-        {showToday && <TodayPanel today={today} loading={todayLoading} onAsk={q => { setShowToday(false); ask(q) }} onRefresh={() => loadToday(true)} />}
+        {showToday && <TodayPanel today={today} loading={todayLoading} onAsk={q => { setShowToday(false); ask(q) }} onRefresh={() => loadToday(true)} onDone={completeTask} />}
         {msgs.length === 0 && (
           <div className="empty">
             <p>Ask about a customer before a call. Tap the mic or type.</p>
@@ -407,6 +474,12 @@ export default function App() {
               <div className="tools">{m.tools.map((t, j) => <span key={j} className="tag">{t}</span>)}</div>
             )}
             <div className="bubble">{m.text || (m.role === 'assistant' && busy && i === msgs.length - 1 ? <span className="thinking">{status || 'working…'}</span> : null)}</div>
+            {m.draft && !m.saved && (
+              <TaskCard draft={m.draft} sessionId={session.current}
+                onSaved={msg => { setMsgs(mm => mm.map((x, j) => j === i ? { ...x, saved: msg } : x)); loadToday(true) }}
+                onCancel={() => setMsgs(mm => mm.map((x, j) => j === i ? { ...x, draft: undefined, saved: 'Task discarded.' } : x))} />
+            )}
+            {m.saved && <div className="saved">{m.saved}</div>}
             {m.ms !== undefined && <div className="meta">{(m.ms / 1000).toFixed(1)} s</div>}
           </div>
         ))}

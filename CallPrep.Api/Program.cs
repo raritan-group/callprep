@@ -224,6 +224,52 @@ app.MapGet("/api/today", async (HttpContext ctx, TodayList today, bool? refresh)
     return Results.Content(await today.Get(user, refresh == true), "application/json");
 });
 
+// ── tasks: P21 activity_trans as the system of record (007_tasks.sql). Create/complete go through the outbox; the VMSQL2 job applies them.
+app.MapGet("/api/tasks", async (HttpContext ctx, Db db, bool? all) =>
+{
+    var u = (AccessUser)ctx.Items["user"]!;
+    var r = await db.Query(@"SELECT activity_trans_no, activity_id, subject, comments, due_date::text AS due_date, completed, assigned_by_name, assigned_to_name, assigned_to_login,
+                                    customer_id, customer_name, source, outbox_id, outbox_status, date_created::text AS created
+                             FROM callprep.task WHERE NOT completed AND (@p1 OR assigned_to_login = @p0)
+                             ORDER BY due_date NULLS LAST, date_created DESC LIMIT 200", 200, u.Login, all == true && u.SeesAll);
+    return Results.Content(r.json, "application/json");
+});
+app.MapGet("/api/task-types", async (Db db) => Results.Content((await db.Query("SELECT activity_id, label FROM callprep.task_type ORDER BY sort", 50)).json, "application/json"));
+app.MapGet("/api/people", async (Db db) => Results.Content((await db.Query(@"SELECT u.login, COALESCE(u.display_name, p.name) AS name, u.role FROM callprep.user_access u JOIN callprep.p21_user p ON p.login = u.login WHERE u.enabled AND u.login LIKE '%@%' ORDER BY 2", 100)).json, "application/json"));
+app.MapPost("/api/tasks", async (HttpContext ctx, Db db, TaskCreate t) =>
+{
+    var u = (AccessUser)ctx.Items["user"]!;
+    if (string.IsNullOrWhiteSpace(t.CustomerId) || string.IsNullOrWhiteSpace(t.AssignedTo) || string.IsNullOrWhiteSpace(t.Subject)) return Results.BadRequest(new { error = "customer, assignee and subject are required" });
+    if (t.Subject.Trim().Length > 255) return Results.BadRequest(new { error = "subject must be 255 characters or fewer" });
+    DateOnly? due = null; if (!string.IsNullOrWhiteSpace(t.DueDate)) { if (!DateOnly.TryParse(t.DueDate, out var d)) return Results.BadRequest(new { error = "due date must be yyyy-MM-dd" }); due = d; }
+    var test = t.Test == true && u.Role == "admin";   // test rows are recorded but never applied to P21 (attempts exhausted)
+    try
+    {
+        var id = await db.Scalar(@$"INSERT INTO callprep.task_outbox (created_by, op, activity_id, customer_id, assigned_to, subject, comments, due_date, transaction_type_cd, transaction_no, status, attempts, error)
+                                   VALUES ('{u.Login.Replace("'", "''")}', 'create', '{(string.IsNullOrWhiteSpace(t.ActivityId) ? "CUST_FU" : t.ActivityId.Trim().Replace("'", "''"))}', '{t.CustomerId.Trim().Replace("'", "''")}',
+                                           '{Access.NormalizeLogin(t.AssignedTo).Replace("'", "''")}', '{t.Subject.Trim().Replace("'", "''")}', {(string.IsNullOrWhiteSpace(t.Comments) ? "NULL" : "'" + t.Comments.Trim().Replace("'", "''") + "'")},
+                                           {(due is null ? "NULL" : "'" + due.Value.ToString("yyyy-MM-dd") + "'")}, {(t.TransactionTypeCd is null ? "NULL" : t.TransactionTypeCd.ToString())}, {(string.IsNullOrWhiteSpace(t.TransactionNo) ? "NULL" : "'" + t.TransactionNo.Trim().Replace("'", "''") + "'")},
+                                           {(test ? "'failed', 3, 'test row (never applied to P21)'" : "'pending', 0, NULL")})
+                                   RETURNING id");
+        var idNum = long.Parse(id!);
+        await db.Audit(u.Login, t.SessionId ?? "", "task_create", new { outbox_id = id, t.CustomerId, t.AssignedTo, t.ActivityId, t.Subject, t.DueDate, test });
+        return Results.Ok(new { ok = true, id = idNum, test, message = test ? "Test row recorded; not sent to P21." : "Saved. It is on their list now and reaches P21 within five minutes." });
+    }
+    catch (PostgresException px) { return Results.BadRequest(new { error = px.MessageText }); }
+});
+app.MapPost("/api/tasks/{no}/complete", async (HttpContext ctx, Db db, string no) =>
+{
+    var u = (AccessUser)ctx.Items["user"]!;
+    if (!Regex.IsMatch(no, @"^\d{1,10}$")) return Results.BadRequest(new { error = "bad task number" });
+    try
+    {
+        var id = await db.Scalar($"INSERT INTO callprep.task_outbox (created_by, op, activity_trans_no) VALUES ('{u.Login.Replace("'", "''")}', 'complete', '{no}') RETURNING id");
+        await db.Audit(u.Login, "", "task_complete", new { outbox_id = id, activity_trans_no = no });
+        return Results.Ok(new { ok = true, id = long.Parse(id!) });
+    }
+    catch (PostgresException px) { return Results.BadRequest(new { error = px.MessageText }); }
+});
+
 app.MapGet("/api/admin/list-settings", async (Db db) =>
     Results.Content((await db.Query("SELECT key, value, note FROM callprep.list_settings ORDER BY key", 100)).json, "application/json"));
 
@@ -264,6 +310,7 @@ app.Run();
 // ───────────────────────────── types ─────────────────────────────
 
 record ChatRequest(string? SessionId, string? User, string Message);
+record TaskCreate(string CustomerId, string AssignedTo, string Subject, string? ActivityId, string? Comments, string? DueDate, int? TransactionTypeCd, string? TransactionNo, string? SessionId, bool? Test);
 record UserAccessEdit(string Login, string? DisplayName, string? Role, string? SalesrepId, bool Enabled, string? Notes);
 
 /// A signed-in person with an enabled callprep.user_access row.
@@ -432,6 +479,8 @@ sealed class Tools(Db db)
           new { query = P("string", "Part of the customer name, or the numeric customer id") }, ["query"]),
         T("customers_near", "Customers located near a place: by town/city name, 5-digit zip (nearby = same first 3 digits), or 2-letter state. Uses the customer's own address from P21 (billing/physical), not job-site ship-tos. Returns active customers first with 12-month sales, rep, address and phone. Use for 'I'm visiting X today, who else is in the area'.",
           new { place = P("string", "Town/city name, 5-digit zip, or 2-letter state"), exclude_customer_id = P("string", "Optional: the account already being visited, left out of the results"), limit = P("integer", "Max rows (default 25)") }, ["place"]),
+        T("draft_task", "Draft a task for a colleague (or yourself) on a customer account: a follow-up, call, visit, quote follow-up, meeting. The draft is shown to the user as a card with Save/Cancel; it is NOT saved until they press Save, and it then becomes a real P21 task (Task Manager) assigned to that person. Use when the user says things like 'assign Doug a follow-up on X', 'remind me to call X Friday', 'have John chase the Trinitas quote'.",
+          new { customer_id = P("string", "Customer id from find_customer"), assigned_to = P("string", "Who: their email, or first/last name as the user said it ('Doug', 'John Convery', 'me')"), activity_id = P("string", "Task type code: CUST_FU (follow up with customer, default), QUOTE FU, CALL, VISIT, MTG, QUOTE, SUBMITTAL, PRE-BID, COMPLAINT"), subject = P("string", "One line, what to do"), comments = P("string", "Detail the assignee needs: what was said, what to bring up, quote/order numbers"), due_date = P("string", "yyyy-MM-dd; work it out from words like Friday or next week using today's date"), transaction_no = P("string", "Optional quote or order number this task is about"), transaction_kind = P("string", "quote | order | opportunity, when transaction_no is given") }, ["customer_id", "assigned_to", "subject"]),
         T("customer_snapshot", "Profile plus sales totals for a customer: market class, rep, trailing-12-month and prior-12-month sales, lifetime sales, last invoice date, top product groups (12 months), open quotes and open orders totals.",
           new { customer_id = P("string", "Customer id from find_customer") }, ["customer_id"]),
         T("peer_gap", "What similar customers buy that this customer does not. 'Similar' = the 40 customers whose product-group purchase mix is most alike (cosine similarity on trailing-12-month sales), NOT the market-class label. Returns product groups this customer is NOT buying (12 months) that at least min_penetration_pct of those lookalikes do buy, plus the top lookalikes so you can name them. This is the core cross-sell question; use it first.",
@@ -451,6 +500,7 @@ sealed class Tools(Db db)
     ];
 
     static object P(string type, string description) => new { type, description };
+    static List<Dictionary<string, object?>> Rows((string json, int rows, long ms) r) => JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(r.json)!;
     static Tool T(string name, string desc, object props, string[] required)
     {
         var dict = new Dictionary<string, JsonElement>();
@@ -511,6 +561,39 @@ sealed class Tools(Db db)
                 if (r.rows == 0)
                     return (JsonSerializer.Serialize(new { note = $"No customers in your book with an address matching '{place}'. Try the town name, a 5-digit zip (matches the surrounding zips too), or the state. Ship-to history in callprep.sales_line (ship_city, county) is a fallback for job-site geography." }), sql, 0, r.ms);
                 return (r.json, sql, r.rows, r.ms);
+            }
+            case "draft_task":
+            {
+                var custId = S("customer_id").Trim(); var who = S("assigned_to").Trim(); var subject = S("subject").Trim();
+                var typeCode = S("activity_id", "CUST_FU").Trim().ToUpperInvariant(); if (typeCode.Length == 0) typeCode = "CUST_FU";
+                var cust = await db.Query("SELECT customer_id::text AS customer_id, customer_name FROM callprep.customer WHERE customer_id::text = @p0", 1, custId);
+                if (cust.rows == 0) return (JsonSerializer.Serialize(new { error = $"customer {custId} is not visible to this user; call find_customer first" }), null, 0, cust.ms);
+                var types = Rows(await db.Query("SELECT activity_id, label FROM callprep.task_type ORDER BY sort", 20));
+                var type = types.FirstOrDefault(t => t["activity_id"]?.ToString() == typeCode) ?? types[0];
+                var people = Rows(await db.Query(@"SELECT u.login, COALESCE(u.display_name, p.name) AS name, p.p21_user_id FROM callprep.user_access u JOIN callprep.p21_user p ON p.login = u.login WHERE u.enabled AND u.login LIKE '%@%' ORDER BY 2", 100));
+                Dictionary<string, object?>? person = null;
+                var me = Db.Login.Value ?? "";
+                if (who.Equals("me", StringComparison.OrdinalIgnoreCase) || who.Length == 0) person = people.FirstOrDefault(x => x["login"]?.ToString() == me);
+                person ??= people.FirstOrDefault(x => string.Equals(x["login"]?.ToString(), who, StringComparison.OrdinalIgnoreCase));
+                if (person is null)
+                {
+                    var tokens = who.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    var hits = people.Where(x => tokens.All(t => (x["name"]?.ToString() ?? "").Contains(t, StringComparison.OrdinalIgnoreCase) || (x["login"]?.ToString() ?? "").Contains(t, StringComparison.OrdinalIgnoreCase))).ToList();
+                    if (hits.Count == 1) person = hits[0];
+                    else return (JsonSerializer.Serialize(new { error = hits.Count == 0 ? $"no Call Prep user matches '{who}'" : $"'{who}' matches several people", people = people.Select(x => new { login = x["login"], name = x["name"] }) }), null, 0, 0);
+                }
+                DateOnly? due = DateOnly.TryParse(S("due_date"), out var d) ? d : null;
+                var kind = S("transaction_kind").Trim().ToLowerInvariant();
+                int? txnCd = kind switch { "quote" => 709, "order" => 222, "opportunity" => 2714, _ => null };
+                var draft = new
+                {
+                    activity_id = type["activity_id"]?.ToString(), type_label = type["label"]?.ToString(),
+                    customer_id = cust.json.Contains("customer_id") ? Rows(cust)[0]["customer_id"]?.ToString() : custId, customer_name = Rows(cust)[0]["customer_name"]?.ToString(),
+                    assigned_to = person["login"]?.ToString(), assigned_to_name = person["name"]?.ToString(),
+                    subject, comments = S("comments").Trim(), due_date = due?.ToString("yyyy-MM-dd"),
+                    transaction_type_cd = txnCd, transaction_no = txnCd is null ? null : S("transaction_no").Trim()
+                };
+                return (JsonSerializer.Serialize(new { draft, note = "The draft is now shown to the user as a card with Save and Cancel. It is NOT saved yet. Tell them to check it and press Save; do not say it has been assigned." }), null, 1, 0);
             }
             case "customer_snapshot":
             {
@@ -701,6 +784,16 @@ sealed class TodayList(Db db)
             gaps.Select(r => Row(r, $"{r["product_group_desc"]} · {r["penetration_pct"]}% of lookalikes buy it, about {Money(r["avg_sales_per_buyer"])} each · " + (r["status"]?.ToString()?.StartsWith("bought") == true ? $"last bought {r["my_last_purchase"]}" : "never bought") + (int.TryParse(r["other_gaps"]?.ToString(), out var og) && og > 0 ? $" · {og} more gaps" : ""),
                 Money(r["sales_12m"]), $"What is {r["customer_name"]} not buying that similar customers are?"))));
 
+        var tasks = Rows(await db.Query(@"SELECT activity_trans_no, activity_id, subject, due_date::text AS due_date, assigned_by_name, customer_id, customer_name, source
+                                           FROM callprep.task WHERE NOT completed AND assigned_to_login = @p0 ORDER BY due_date NULLS LAST, date_created DESC LIMIT @p1", PerSection, u.Login, PerSection));
+        var taskCount = int.Parse((await db.Scalar($"SELECT count(*) FROM callprep.task WHERE NOT completed AND assigned_to_login = '{u.Login.Replace("'", "''")}'")) ?? "0");
+        sections.Add(new { key = "tasks", title = "Your tasks", blurb = "Open tasks assigned to you, in P21 or on their way there. Done marks them complete in P21.", count = taskCount,
+            headline = taskCount == 0 ? "nothing open" : tasks.Count(t => t["due_date"] is not null && DateOnly.TryParse(t["due_date"]!.ToString(), out var dd) && dd <= DateOnly.FromDateTime(DateTime.Today)) is var late && late > 0 ? $"{late} due today or overdue" : "none overdue",
+            rows = tasks.Select(t => new { customer_id = t["customer_id"]?.ToString(), customer_name = t["customer_name"]?.ToString() ?? ("customer " + t["customer_id"]),
+                detail = $"{t["activity_id"]} · {t["subject"]}" + (t["due_date"] is null ? "" : $" · due {t["due_date"]}") + (t["assigned_by_name"] is null ? "" : $" · from {t["assigned_by_name"]}") + (t["source"]?.ToString() == "outbox" ? " · on its way to P21" : ""),
+                dollars = "", task_no = t["activity_trans_no"]?.ToString(),
+                question = $"I have a task on {t["customer_name"] ?? t["customer_id"]}: \"{t["subject"]}\". Brief me on the account before I do it: recent activity, open quotes, anything I should know." }).ToList() });
+
         var fresh = Rows(await db.Query(@"SELECT customer_id::text AS customer_id, customer_name, first_invoice::text AS first_invoice, days_ago, sales_to_date, invoices, product_groups
                                            FROM callprep.list_new_accounts ORDER BY sales_to_date DESC LIMIT @p0", PerSection, PerSection));
         sections.Add(Section("new_accounts", "New accounts", "First invoice within the last six weeks. A second order is the one that makes them a customer.", nt.n, Compact(nt.sum) + " so far",
@@ -710,7 +803,7 @@ sealed class TodayList(Db db)
         sw.Stop();
         var json = JsonSerializer.Serialize(new { scope = u.ScopeText, generated_at = DateTime.Now.ToString("yyyy-MM-dd HH:mm"), ms = sw.ElapsedMilliseconds, sections });
         cache[u.Login] = (DateTime.UtcNow, json);
-        await db.Audit(u.Login, "", warm ? "today_warm" : "today", new { ms = sw.ElapsedMilliseconds, rows = new { quotes = quotes.Count, quiet = quiet.Count, reorder = reorder.Count, gaps = gaps.Count, fresh = fresh.Count } }, sw.ElapsedMilliseconds);
+        await db.Audit(u.Login, "", warm ? "today_warm" : "today", new { ms = sw.ElapsedMilliseconds, rows = new { quotes = quotes.Count, quiet = quiet.Count, reorder = reorder.Count, gaps = gaps.Count, fresh = fresh.Count, tasks = tasks.Count } }, sw.ElapsedMilliseconds);
         return json;
     }
 
@@ -770,6 +863,7 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
         - When a company is named, call find_customer first, then use the customer_id. If several match, pick the one with the most recent sales and say which you picked.
         - "What is X not buying that similar customers are" = peer_gap. Peers are the customers whose purchase mix looks most like this one (behavior, not the class label). Name two or three of the lookalikes so the rep can judge the comparison ("compared against 40 shops like Bennett Brothers Mechanical and L&L Mechanical"). Use class_gap only if asked for the market-class view, and caveat that the class label mixes trades.
         - "Who else is near X" or "I'm visiting X today" = find_customer for X, then customers_near with X's town or zip (exclude X). Say which is the customer's own address versus job-site ship-to history; contractors work all over.
+        - Tasks: "assign X a follow-up", "remind me to call", "have John chase that quote" = draft_task (find_customer first). The draft appears as a card the user must Save; never say a task was created or assigned. Dates: work out yyyy-MM-dd from today.
         - Prefer the named tools. Use run_select only when they cannot answer the question.
         - Be fast and concrete. A rep reads this in the minute before a call. Lead with the answer, then 3 to 6 short bullets with dollar figures and dates. Name product groups the way the data names them. Do not pad, do not restate the question.
         - Judgment: the data shows what a customer buys, not what kind of contractor they are. If a gap looks like something they would never buy (an underground pipe group for a mechanical contractor, for example), say that as a caveat rather than pitching it.
@@ -850,6 +944,8 @@ sealed class Agent(AnthropicClient client, Tools tools, Db db)
                     }
                     await db.Audit(user, session, "tool", new { tool = tu.Name, input, sql }, ms, rows);
                     pendingEvents.Add(new { type = "tool", name = tu.Name, rows, ms });
+                    if (tu.Name == "draft_task" && result.Contains("\"draft\""))
+                        pendingEvents.Add(new { type = "task_draft", draft = JsonDocument.Parse(result).RootElement.GetProperty("draft").Clone() });
                     results.Add(new ToolResultBlockParam { ToolUseID = tu.ID, Content = result });
                 }
             }

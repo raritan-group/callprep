@@ -17,7 +17,7 @@ public class ChatTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtu
             ? s.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             : TestEnv.DemoCustomers.Take(3)).Select(c => new object[] { c });
 
-    sealed record Turn(string Text, List<string> Tools, List<string> Errors, long Ms, long InTok, long OutTok, string Session);
+    sealed record Turn(string Text, List<string> Tools, List<string> Errors, long Ms, long InTok, long OutTok, string Session, JsonElement? Draft);
 
     async Task<Turn> Ask(HttpClient c, string session, string question)
     {
@@ -27,7 +27,7 @@ public class ChatTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtu
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
         Assert.StartsWith("text/event-stream", res.Content.Headers.ContentType!.ToString());
         var text = new System.Text.StringBuilder(); var tools = new List<string>(); var errors = new List<string>();
-        long ms = 0, inTok = 0, outTok = 0; string sid = ""; bool done = false;
+        long ms = 0, inTok = 0, outTok = 0; string sid = ""; bool done = false; JsonElement? draft = null;
         using var reader = new StreamReader(await res.Content.ReadAsStreamAsync());
         while (await reader.ReadLineAsync() is { } line)
         {
@@ -38,13 +38,14 @@ public class ChatTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtu
                 case "text": text.Append(ev.GetProperty("text").GetString()); break;
                 case "tool": tools.Add($"{ev.GetProperty("name")}({ev.GetProperty("rows")} rows, {ev.GetProperty("ms")} ms)"); break;
                 case "error": errors.Add(ev.GetProperty("text").GetString() ?? "?"); break;
+                case "task_draft": draft = ev.GetProperty("draft").Clone(); break;
                 case "done": done = true; ms = ev.GetProperty("ms").GetInt64(); inTok = ev.GetProperty("input_tokens").GetInt64(); outTok = ev.GetProperty("output_tokens").GetInt64(); sid = ev.GetProperty("session_id").GetString()!; break;
                 default: Assert.Fail("unknown event type " + ev); break;
             }
         }
         sw.Stop();
         Assert.True(done || errors.Count > 0, "stream ended without a done event");
-        return new Turn(text.ToString(), tools, errors, ms, inTok, outTok, sid);
+        return new Turn(text.ToString(), tools, errors, ms, inTok, outTok, sid, draft);
     }
 
     [SkippableTheory]
@@ -135,6 +136,22 @@ public class ChatTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtu
         Assert.Empty(t.Errors);
         Assert.Contains(t.Tools, x => x.StartsWith("customers_near"));
         Assert.True(t.Text.Length > 80);
+    }
+
+    [SkippableFact]
+    public async Task Assigning_a_task_produces_a_draft_card_not_a_save()
+    {
+        TestEnv.RequireTunnel(); TestEnv.RequireLive();
+        var c = app.ClientAs(TestEnv.AdminLogin);
+        c.Timeout = TimeSpan.FromMinutes(3);
+        var t = await Ask(c, TestEnv.TestSessionPrefix + Guid.NewGuid().ToString("N"), "Assign Doug Dickman a follow-up on Buist about the Trinitas AHU-2 quote, due Friday. Tell him to ask if the cooling tower job was awarded.");
+        Report("Buist task", "draft", t);
+        Assert.Empty(t.Errors);
+        Assert.Contains(t.Tools, x => x.StartsWith("draft_task"));
+        Assert.NotNull(t.Draft);
+        Assert.Equal(TestEnv.RepLogin, t.Draft!.Value.GetProperty("assigned_to").GetString());
+        Assert.Equal("10046", t.Draft.Value.GetProperty("customer_id").GetString());
+        Assert.DoesNotContain("has been assigned", t.Text, StringComparison.OrdinalIgnoreCase);
     }
 
     void Report(string customer, string kind, Turn t)

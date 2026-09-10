@@ -151,8 +151,8 @@ public class ApiTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtur
         var rep = JsonDocument.Parse(repBody).RootElement;
         Assert.StartsWith("accounts assigned to", rep.GetProperty("scope").GetString());
         var sections = rep.GetProperty("sections").EnumerateArray().ToList();
-        Assert.Equal(new[] { "stale_quotes", "going_quiet", "reorder_due", "category_gaps", "new_accounts" }, sections.Select(s => s.GetProperty("key").GetString()));
-        var rows = sections.SelectMany(s => s.GetProperty("rows").EnumerateArray()).ToList();
+        Assert.Equal(new[] { "stale_quotes", "going_quiet", "reorder_due", "category_gaps", "tasks", "new_accounts" }, sections.Select(s => s.GetProperty("key").GetString()));
+        var rows = sections.Where(s => s.GetProperty("key").GetString() != "tasks").SelectMany(s => s.GetProperty("rows").EnumerateArray()).ToList();   // tasks may sit on accounts outside the book, on purpose
         Assert.True(rows.Count > 0, "rep list is empty");
         log.WriteLine($"rep list: {rows.Count} rows in {rep.GetProperty("ms")} ms");
         foreach (var r in rows)
@@ -182,6 +182,54 @@ public class ApiTests(CallPrepFactory app, ITestOutputHelper log) : IClassFixtur
         Assert.Equal(HttpStatusCode.Forbidden, (await app.ClientAs(TestEnv.RepLogin).GetAsync("/api/admin/list-settings")).StatusCode);
         var settings = await app.ClientAs(TestEnv.AdminLogin).GetFromJsonAsync<JsonElement>("/api/admin/list-settings");
         Assert.True(settings.GetArrayLength() >= 13);
+    }
+
+
+    [SkippableFact]
+    public async Task Tasks_api_create_list_and_complete_go_through_the_outbox()
+    {
+        TestEnv.RequireTunnel();
+        var admin = app.ClientAs(TestEnv.AdminLogin);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await app.ClientAs(null).GetAsync("/api/tasks")).StatusCode);
+
+        var types = await admin.GetFromJsonAsync<JsonElement>("/api/task-types");
+        Assert.True(types.GetArrayLength() >= 5);
+        var people = await admin.GetFromJsonAsync<JsonElement>("/api/people");
+        Assert.Contains(people.EnumerateArray(), x => x.GetProperty("login").GetString() == TestEnv.RepLogin);
+
+        // validation, no writes
+        Assert.Equal(HttpStatusCode.BadRequest, (await admin.PostAsJsonAsync("/api/tasks", new { customerId = "10046", assignedTo = TestEnv.RepLogin, subject = "" })).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await admin.PostAsJsonAsync("/api/tasks", new { customerId = "10046", assignedTo = TestEnv.RepLogin, subject = "x", dueDate = "Friday" })).StatusCode);
+        var badAssignee = await admin.PostAsJsonAsync("/api/tasks", new { customerId = "10046", assignedTo = TestEnv.UnknownLogin, subject = "[test] bad assignee", test = true });
+        Assert.Equal(HttpStatusCode.BadRequest, badAssignee.StatusCode);
+        Assert.Contains("not a Call Prep user", await badAssignee.Content.ReadAsStringAsync());
+
+        // create as a TEST row (admin only): recorded, visible to the assignee, never sent to P21
+        var created = await admin.PostAsJsonAsync("/api/tasks", new { customerId = "10046", assignedTo = TestEnv.RepLogin, subject = "[test] api create", activityId = "QUOTE FU", comments = "from ApiTests", dueDate = DateTime.Today.AddDays(2).ToString("yyyy-MM-dd"), test = true });
+        var body = await created.Content.ReadAsStringAsync();
+        Assert.True(created.StatusCode == HttpStatusCode.OK, body);
+        var j = JsonDocument.Parse(body).RootElement;
+        Assert.True(j.GetProperty("test").GetBoolean());
+        var id = j.GetProperty("id").GetInt64();
+
+        var mine = await app.ClientAs(TestEnv.RepLogin).GetFromJsonAsync<JsonElement>("/api/tasks");
+        var row = mine.EnumerateArray().FirstOrDefault(x => x.TryGetProperty("outbox_id", out var o) && o.ValueKind == JsonValueKind.Number && o.GetInt64() == id);
+        Assert.True(row.ValueKind == JsonValueKind.Object, "assignee does not see the new task");
+        Assert.Equal("[test] api create", row.GetProperty("subject").GetString());
+        log.WriteLine($"outbox #{id} visible to {TestEnv.RepLogin}: {row}");
+
+        // a rep cannot flag a test row (admin only): it becomes a real pending row... so a rep POST is not exercised here.
+        // complete: unknown/not-visible task number is refused by the database guard
+        var bad = await app.ClientAs(TestEnv.RepLogin).PostAsync("/api/tasks/999999999/complete", null);
+        Assert.Equal(HttpStatusCode.BadRequest, bad.StatusCode);
+        Assert.Contains("not visible", await bad.Content.ReadAsStringAsync());
+        Assert.Equal(HttpStatusCode.BadRequest, (await admin.PostAsync("/api/tasks/abc/complete", null)).StatusCode);
+
+        // week list carries a tasks section for the assignee
+        var today = await app.ClientAs(TestEnv.RepLogin).GetFromJsonAsync<JsonElement>("/api/today?refresh=true");
+        var tasks = today.GetProperty("sections").EnumerateArray().First(sct => sct.GetProperty("key").GetString() == "tasks");
+        Assert.True(tasks.GetProperty("count").GetInt32() >= 1);
+        Assert.Contains(tasks.GetProperty("rows").EnumerateArray(), r => r.GetProperty("detail").GetString()!.Contains("[test] api create"));
     }
 
     [SkippableFact]

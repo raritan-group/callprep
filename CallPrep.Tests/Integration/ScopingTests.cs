@@ -84,4 +84,54 @@ public class ScopingTests(DbFixture fx) : IClassFixture<DbFixture>
         // admin still enabled afterwards
         using (Db.As(TestEnv.AdminLogin)) Assert.NotNull(await fx.Db.Lookup(TestEnv.AdminLogin));
     }
+
+    [SkippableFact]
+    public async Task Task_outbox_guard_and_task_view_scoping()
+    {
+        TestEnv.RequireTunnel();
+        // rows inserted here use status='failed', attempts=3 so the VMSQL2 writeback never applies them to P21
+        const string marker = "[test] scoping";
+        using (Db.As(TestEnv.RepLogin))
+        {
+            // a rep cannot write a task as someone else
+            await Assert.ThrowsAsync<Npgsql.PostgresException>(() => fx.Db.Exec(
+                "INSERT INTO callprep.task_outbox (created_by, op, activity_id, customer_id, assigned_to, subject, status, attempts) VALUES (@p0,'create','CUST_FU','10046',@p1,@p2,'failed',3)",
+                TestEnv.AdminLogin, TestEnv.RepLogin, marker));
+            // nor assign to someone who is not a Call Prep user
+            await Assert.ThrowsAsync<Npgsql.PostgresException>(() => fx.Db.Exec(
+                "INSERT INTO callprep.task_outbox (created_by, op, activity_id, customer_id, assigned_to, subject, status, attempts) VALUES (@p0,'create','CUST_FU','10046',@p1,@p2,'failed',3)",
+                TestEnv.RepLogin, TestEnv.UnknownLogin, marker));
+        }
+        long id;
+        using (Db.As(TestEnv.AdminLogin))
+        {
+            // admin assigns a task to Doug
+            var idText = await fx.Db.Scalar($"INSERT INTO callprep.task_outbox (created_by, op, activity_id, customer_id, assigned_to, subject, due_date, status, attempts, error) VALUES ('{TestEnv.AdminLogin}','create','CUST_FU','10046','{TestEnv.RepLogin}','{marker}', CURRENT_DATE + 3, 'failed', 3, 'test row') RETURNING id");
+            id = long.Parse(idText!);
+        }
+        try
+        {
+            using (Db.As(TestEnv.RepLogin))
+            {
+                var (j, n, _) = await fx.Db.Query($"SELECT subject, assigned_to_login, customer_name, source, outbox_status FROM callprep.task WHERE outbox_id = {id}", 5);
+                Assert.Equal(1, n);
+                var row = JsonDocument.Parse(j).RootElement[0];
+                Assert.Equal(TestEnv.RepLogin, row.GetProperty("assigned_to_login").GetString());
+                Assert.Equal("BUIST INCORPORATED", row.GetProperty("customer_name").GetString());
+                Assert.Equal("outbox", row.GetProperty("source").GetString());
+            }
+            using (Db.As("kperry@raritangroup.com"))
+            {
+                // another rep, neither assignee nor creator: invisible
+                var (_, n, _) = await fx.Db.Query($"SELECT 1 FROM callprep.task WHERE outbox_id = {id}", 5);
+                Assert.Equal(0, n);
+            }
+            using (Db.As(TestEnv.AdminLogin))
+            {
+                var (_, n, _) = await fx.Db.Query($"SELECT 1 FROM callprep.task WHERE outbox_id = {id}", 5);
+                Assert.Equal(1, n);
+            }
+        }
+        finally { /* callprep_ro cannot delete; the row stays as a test row with attempts exhausted */ }
+    }
 }

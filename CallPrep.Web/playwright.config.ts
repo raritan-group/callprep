@@ -28,7 +28,7 @@ export default defineConfig({
   },
   projects: [
     // UI logic with a mocked API: no sign-in, no tunnel, no credits.   npx playwright test --project=ui
-    { name: 'ui', testMatch: /ui-(mock|voice)\.spec\.ts/, use: { ...devices['Desktop Chrome'], baseURL: 'http://localhost:4173' } },
+    { name: 'ui', testMatch: /ui-(mock|voice|tasks)\.spec\.ts/, use: { ...devices['Desktop Chrome'], baseURL: 'http://localhost:4173' } },
     { name: 'setup', testMatch: /auth\.setup\.ts/, use: { ...devices['Desktop Chrome'], headless: false } },
     { name: 'chromium', testMatch: /demo\.spec\.ts/, use: { ...devices['Desktop Chrome'], storageState: AUTH_FILE } },
   ],
